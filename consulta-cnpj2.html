@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Consulta CNPJ — Dados públicos da Receita Federal</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .animate-spin { animation: spin 1s linear infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+  .animate-pulse { animation: pulse 1.6s ease-in-out infinite; }
+  details > summary { list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  details[open] > summary .chevron { transform: rotate(180deg); }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+</style>
+</head>
+<body class="min-h-screen bg-slate-100 text-slate-900 antialiased">
+
+<div id="app"></div>
+
+<script>
+/* ================================================================== */
+/* Utilitários de CNPJ, formatação e inspeção de dados (cnpj.ts)       */
+/* ================================================================== */
+
+const onlyDigits = (s) => String(s).replace(/\D/g, '');
+
+function maskCNPJ(value) {
+  const d = onlyDigits(value).slice(0, 14);
+  let out = d;
+  if (d.length > 2) out = d.slice(0, 2) + '.' + d.slice(2);
+  if (d.length > 5) out = out.slice(0, 6) + '.' + out.slice(6);
+  if (d.length > 9) out = out.slice(0, 10) + '/' + out.slice(10);
+  if (d.length > 13) out = out.slice(0, 15) + '-' + out.slice(15);
+  return out;
+}
+
+function formatCNPJ(value) {
+  const d = onlyDigits(String(value ?? ''));
+  if (d.length !== 14) return String(value ?? '');
+  return d.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
+}
+
+function isValidCNPJ(value) {
+  const c = onlyDigits(value);
+  if (c.length !== 14) return false;
+  if (/^(\d)\1{13}$/.test(c)) return false;
+  const calc = (base, factors) => {
+    const sum = base.split('').reduce((acc, n, i) => acc + Number(n) * factors[i], 0);
+    const rest = sum % 11;
+    return rest < 2 ? 0 : 11 - rest;
+  };
+  const d1 = calc(c.slice(0, 12), [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]);
+  const d2 = calc(c.slice(0, 12) + d1, [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]);
+  return d1 === Number(c[12]) && d2 === Number(c[13]);
+}
+
+function formatCEP(value) {
+  const d = onlyDigits(String(value ?? ''));
+  if (d.length !== 8) return String(value ?? '');
+  return d.replace(/^(\d{5})(\d{3})$/, '$1-$2');
+}
+
+function formatPhone(tel, ddd) {
+  if (!tel) return null;
+  const d = onlyDigits(String(tel));
+  if (!d) return null;
+  let num = d;
+  if (d.length === 8) num = d.replace(/^(\d{4})(\d{4})$/, '$1-$2');
+  else if (d.length === 9) num = d.replace(/^(\d{5})(\d{4})$/, '$1-$2');
+  const area = ddd ? onlyDigits(String(ddd)) : '';
+  return area ? `(${area}) ${num}` : num;
+}
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+
+function formatDateBR(value) {
+  if (ISO_DATE.test(value)) {
+    const [y, m, d] = value.split('-');
+    return `${d}/${m}/${y}`;
+  }
+  if (ISO_DATETIME.test(value)) {
+    const dt = new Date(value);
+    if (isNaN(dt.getTime())) return value;
+    const date = dt.toLocaleDateString('pt-BR');
+    const hh = String(dt.getHours()).padStart(2, '0');
+    const mm = String(dt.getMinutes()).padStart(2, '0');
+    return hh === '00' && mm === '00' ? date : `${date} ${hh}:${mm}`;
+  }
+  return value;
+}
+
+function formatCurrencyBRL(value) {
+  const n = typeof value === 'number' ? value : Number(String(value).replace(',', '.'));
+  if (isNaN(n)) return String(value);
+  return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+}
+
+const LABELS = {
+  cnpj_raiz: 'CNPJ Raiz', cnpj: 'CNPJ', cnpj_ordem: 'Nº do Estabelecimento',
+  cnpj_digito_verificador: 'Dígito Verificador', razao_social: 'Razão Social',
+  nome_fantasia: 'Nome Fantasia', capital_social: 'Capital Social',
+  responsavel_federativo: 'Responsável Federativo', atualizado_em: 'Atualizado em',
+  porte: 'Porte', natureza_juridica: 'Natureza Jurídica',
+  qualificacao_do_responsavel: 'Qualificação do Responsável', socios: 'Quadro Societário',
+  simples: 'Simples Nacional', estabelecimento: 'Estabelecimento', tipo: 'Tipo',
+  situacao_cadastral: 'Situação Cadastral', data_situacao_cadastral: 'Data da Situação Cadastral',
+  data_inicio_atividade: 'Data de Início de Atividade', nome_cidade_exterior: 'Cidade no Exterior',
+  tipo_logradouro: 'Tipo de Logradouro', logradouro: 'Logradouro', numero: 'Número',
+  complemento: 'Complemento', bairro: 'Bairro', cep: 'CEP', ddd1: 'DDD 1',
+  telefone1: 'Telefone 1', ddd2: 'DDD 2', telefone2: 'Telefone 2', ddd_fax: 'DDD Fax',
+  fax: 'Fax', email: 'E-mail', situacao_especial: 'Situação Especial',
+  data_situacao_especial: 'Data da Situação Especial',
+  atividade_principal: 'Atividade Econômica Principal (CNAE)',
+  atividades_secundarias: 'Atividades Econômicas Secundárias (CNAEs)', pais: 'País',
+  estado: 'Estado', cidade: 'Cidade', motivo_situacao_cadastral: 'Motivo da Situação Cadastral',
+  inscricoes_estaduais: 'Inscrições Estaduais', inscricao_estadual: 'Inscrição Estadual',
+  ativo: 'Ativo', id: 'ID', descricao: 'Descrição', secao: 'Seção', divisao: 'Divisão',
+  grupo: 'Grupo', classe: 'Classe', subclasse: 'Subclasse', sigla: 'Sigla (UF)', nome: 'Nome',
+  ibge_id: 'Código IBGE', siafi_id: 'Código SIAFI', iso2: 'Código ISO 2', iso3: 'Código ISO 3',
+  comex_id: 'Código COMEX', pais_id: 'ID do País', cpf_cnpj_socio: 'CPF/CNPJ do Sócio',
+  data_entrada: 'Data de Entrada', cpf_representante_legal: 'CPF do Representante Legal',
+  nome_representante: 'Nome do Representante', faixa_etaria: 'Faixa Etária',
+  qualificacao_socio: 'Qualificação do Sócio', qualificacao_representante: 'Qualificação do Representante',
+  optante: 'Optante', data_opcao: 'Data de Opção', data_exclusao: 'Data de Exclusão',
+  ultima_atualizacao: 'Última Atualização', status: 'Status',
+  identificador_matriz_filial: 'Identificador Matriz/Filial',
+};
+
+const ACRONYMS = new Set(['cnpj', 'cpf', 'uf', 'cep', 'ddd', 'id', 'ibge', 'siafi', 'iso', 'cnae', 'comex', 'ie', 'iso2', 'iso3']);
+
+function humanizeKey(key) {
+  if (LABELS[key]) return LABELS[key];
+  return key.replace(/[_-]+/g, ' ').split(' ').filter(Boolean).map((w) => {
+    const lower = w.toLowerCase();
+    if (ACRONYMS.has(lower)) return lower.toUpperCase();
+    return lower.charAt(0).toUpperCase() + lower.slice(1);
+  }).join(' ');
+}
+
+function isFilled(v) {
+  if (v === null || v === undefined) return false;
+  if (typeof v === 'string' && v.trim() === '') return false;
+  return true;
+}
+
+function formatValue(key, value) {
+  if (!isFilled(value)) return '—';
+  if (typeof value === 'boolean') return value ? 'Sim' : 'Não';
+  const k = key.toLowerCase();
+  const s = String(value);
+  if (k === 'capital_social') return formatCurrencyBRL(s);
+  if (k === 'cep') return formatCEP(s);
+  if (k === 'cnpj' || (k.includes('cnpj') && onlyDigits(s).length === 14)) return formatCNPJ(s);
+  if (k === 'telefone1' || k === 'telefone2' || k === 'fax') return formatPhone(s) ?? s;
+  if (k.startsWith('data') || k.endsWith('_em') || ISO_DATE.test(s) || ISO_DATETIME.test(s)) return formatDateBR(s);
+  return s;
+}
+
+function countFields(node) {
+  let filled = 0, total = 0;
+  const walk = (n) => {
+    if (Array.isArray(n)) { n.forEach(walk); return; }
+    if (n !== null && typeof n === 'object') { Object.values(n).forEach(walk); return; }
+    total += 1;
+    if (isFilled(n)) filled += 1;
+  };
+  walk(node);
+  return { filled, total };
+}
+
+function situacaoTone(situacao) {
+  const s = (situacao ?? '').toLowerCase();
+  if (s === 'ativa') return { badge: 'bg-emerald-50 text-emerald-700 ring-emerald-200', dot: 'bg-emerald-500' };
+  if (s === 'baixada') return { badge: 'bg-rose-50 text-rose-700 ring-rose-200', dot: 'bg-rose-500' };
+  if (s === 'suspensa') return { badge: 'bg-amber-50 text-amber-700 ring-amber-200', dot: 'bg-amber-500' };
+  if (s === 'inapta') return { badge: 'bg-orange-50 text-orange-700 ring-orange-200', dot: 'bg-orange-500' };
+  if (s === 'nula') return { badge: 'bg-slate-100 text-slate-600 ring-slate-200', dot: 'bg-slate-400' };
+  return { badge: 'bg-sky-50 text-sky-700 ring-sky-200', dot: 'bg-sky-500' };
+}
+
+/* ================================================================== */
+/* Ícones SVG inline                                                    */
+/* ================================================================== */
+
+function icon(paths, size = 18, extraClass = '') {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="${extraClass}">${paths}</svg>`;
+}
+const Icons = {
+  search: (s=18,c='') => icon(`<circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/>`, s, c),
+  building: (s=18,c='') => icon(`<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M9 21v-4h6v4"/><path d="M8 7h2M14 7h2M8 11h2M14 11h2"/>`, s, c),
+  mapPin: (s=18,c='') => icon(`<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/>`, s, c),
+  phone: (s=18,c='') => icon(`<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3 19.5 19.5 0 0 1-6-6 19.8 19.8 0 0 1-3-8.7A2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.13.96.36 1.9.7 2.8a2 2 0 0 1-.45 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.45c.9.34 1.84.57 2.8.7A2 2 0 0 1 22 16.9Z"/>`, s, c),
+  mail: (s=18,c='') => icon(`<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/>`, s, c),
+  fileText: (s=18,c='') => icon(`<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M9 13h6M9 17h6"/>`, s, c),
+  copy: (s=18,c='') => icon(`<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>`, s, c),
+  check: (s=18,c='') => icon(`<path d="M20 6 9 17l-5-5"/>`, s, c),
+  alert: (s=18,c='') => icon(`<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>`, s, c),
+  spinner: (s=18,c='') => icon(`<path d="M21 12a9 9 0 1 1-6.2-8.56"/>`, s, `animate-spin ${c}`),
+  chevronDown: (s=18,c='') => icon(`<path d="m6 9 6 6 6-6"/>`, s, c),
+  calendar: (s=18,c='') => icon(`<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>`, s, c),
+  banknote: (s=18,c='') => icon(`<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 12h.01M18 12h.01"/>`, s, c),
+  users: (s=18,c='') => icon(`<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>`, s, c),
+  globe: (s=18,c='') => icon(`<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>`, s, c),
+  shield: (s=18,c='') => icon(`<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1Z"/>`, s, c),
+  hash: (s=18,c='') => icon(`<path d="M4 9h16M4 15h16"/><path d="M10 3 8 21M16 3l-2 18"/>`, s, c),
+  list: (s=18,c='') => icon(`<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>`, s, c),
+  code: (s=18,c='') => icon(`<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>`, s, c),
+  refresh: (s=18,c='') => icon(`<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/>`, s, c),
+  landmark: (s=18,c='') => icon(`<path d="M3 22h18"/><path d="M6 18v-7M10 18v-7M14 18v-7M18 18v-7"/><path d="m12 2 9 5H3Z"/>`, s, c),
+  idCard: (s=18,c='') => icon(`<rect x="2" y="4" width="20" height="16" rx="2"/><circle cx="8" cy="10" r="2"/><path d="M5.5 15c.5-1.4 1.4-2 2.5-2s2 .6 2.5 2"/><path d="M14 9h5M14 13h5"/><path d="M14 17h3"/>`, s, c),
+  info: (s=18,c='') => icon(`<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>`, s, c),
+  database: (s=18,c='') => icon(`<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>`, s, c),
+  activity: (s=18,c='') => icon(`<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>`, s, c),
+  briefcase: (s=18,c='') => icon(`<rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>`, s, c),
+};
+
+function iconFor(key) {
+  const k = key.toLowerCase();
+  if (k.includes('socio')) return Icons.users(17);
+  if (k.includes('estabelecimento')) return Icons.building(17);
+  if (k.includes('atividade')) return Icons.activity(17);
+  if (k.includes('inscri')) return Icons.idCard(17);
+  if (k === 'pais' || k.includes('pais')) return Icons.globe(17);
+  if (k === 'estado' || k === 'cidade') return Icons.mapPin(17);
+  if (k.includes('natureza') || k.includes('qualificacao') || k.includes('porte')) return Icons.landmark(17);
+  if (k.includes('simples') || k.includes('capital')) return Icons.banknote(17);
+  return Icons.fileText(17);
+}
+
+/* ================================================================== */
+/* Helpers de DOM / escaping                                           */
+/* ================================================================== */
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+/* ================================================================== */
+/* Estado da aplicação                                                  */
+/* ================================================================== */
+
+const API = 'https://publica.cnpj.ws/cnpj/';
+const EXAMPLES = [
+  { label: 'Open Knowledge Brasil', cnpj: '19.131.243/0001-97' },
+  { label: 'Banco do Brasil', cnpj: '00.000.000/0001-91' },
+  { label: 'Nubank', cnpj: '18.236.120/0001-58' },
+];
+
+const state = {
+  input: '',
+  status: 'idle', // idle | loading | success | error
+  data: null,
+  error: null,
+  tab: 'resumo', // resumo | completo | json
+  copied: false,
+  queried: '',
+  touched: false,
+};
+
+let abortCtrl = null;
+let copyTimer = null;
+
+async function fetchCNPJ(cnpj, signal) {
+  let res;
+  try {
+    res = await fetch(API + cnpj, { signal, headers: { Accept: 'application/json' } });
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    throw { title: 'Falha de conexão', message: 'Não foi possível conectar à API pública. Verifique sua internet e tente novamente.' };
+  }
+  let body = null;
+  try { body = await res.json(); } catch { /* corpo vazio ou não-JSON */ }
+
+  if (!res.ok) {
+    const detalhes = body?.detalhes;
+    const msg = Array.isArray(detalhes) ? detalhes.join(' ') : detalhes;
+    if (res.status === 429) throw { title: 'Limite de consultas atingido', message: msg ?? 'A API pública permite apenas 3 consultas por minuto por IP.', hint: 'Aguarde cerca de 1 minuto e tente novamente.' };
+    if (res.status === 400) throw { title: 'CNPJ inválido', message: msg ?? 'O CNPJ informado não é válido.' };
+    if (res.status === 404) throw { title: 'CNPJ não encontrado', message: msg ?? 'Este CNPJ não consta na base da Receita Federal disponibilizada pela API.' };
+    throw { title: `Erro ${res.status}`, message: msg ?? 'A API retornou um erro inesperado. Tente novamente em instantes.' };
+  }
+  return body;
+}
+
+async function search(digits) {
+  if (abortCtrl) abortCtrl.abort();
+  const ctrl = new AbortController();
+  abortCtrl = ctrl;
+  const timeout = setTimeout(() => ctrl.abort(), 20000);
+
+  state.status = 'loading';
+  state.error = null;
+  state.queried = digits;
+  render();
+
+  try {
+    const json = await fetchCNPJ(digits, ctrl.signal);
+    state.data = json;
+    state.status = 'success';
+    state.tab = 'resumo';
+    render();
+    setTimeout(() => {
+      document.getElementById('resultado')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 60);
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      state.error = { title: 'Tempo esgotado', message: 'A API demorou demais para responder. Tente novamente.' };
+    } else {
+      state.error = e;
+    }
+    state.status = 'error';
+    state.data = null;
+    render();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function reset() {
+  if (abortCtrl) abortCtrl.abort();
+  state.input = '';
+  state.data = null;
+  state.error = null;
+  state.status = 'idle';
+  state.touched = false;
+  render();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function copyJSON() {
+  if (!state.data) return;
+  const text = JSON.stringify(state.data, null, 2);
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+  state.copied = true;
+  render();
+  if (copyTimer) clearTimeout(copyTimer);
+  copyTimer = setTimeout(() => { state.copied = false; render(); }, 2000);
+}
+
+/* ================================================================== */
+/* Renderização: SearchBar                                             */
+/* ================================================================== */
+
+function renderSearchBar() {
+  const digits = onlyDigits(state.input);
+  const complete = digits.length === 14;
+  const valid = complete && isValidCNPJ(digits);
+  const showError = state.touched && complete && !valid;
+  const loading = state.status === 'loading';
+
+  return `
+    <div class="w-full">
+      <div class="flex flex-col gap-3 rounded-2xl border bg-white p-3 shadow-lg shadow-indigo-950/5 transition sm:flex-row sm:items-center ${showError ? 'border-rose-300 ring-4 ring-rose-100' : 'border-slate-200 focus-within:border-indigo-400 focus-within:ring-4 focus-within:ring-indigo-100'}">
+        <div class="flex flex-1 items-center gap-3 px-2">
+          ${Icons.search(22, 'shrink-0 text-slate-400')}
+          <input id="cnpj-input" value="${esc(state.input)}" placeholder="00.000.000/0000-00" inputmode="numeric" autocomplete="off" spellcheck="false" aria-label="CNPJ"
+            class="w-full bg-transparent py-2 text-lg font-medium tracking-wide text-slate-800 placeholder:font-normal placeholder:text-slate-400 focus:outline-none" />
+        </div>
+        <button id="search-btn" ${loading || !complete ? 'disabled' : ''}
+          class="inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-8 py-3 text-base font-semibold text-white shadow-sm transition hover:bg-indigo-700 focus:outline-none focus-visible:ring-4 focus-visible:ring-indigo-300 disabled:cursor-not-allowed disabled:bg-slate-300 sm:w-auto w-full">
+          ${loading ? `${Icons.spinner(20)} Consultando…` : `${Icons.search(20)} Consultar`}
+        </button>
+      </div>
+      ${showError ? `<p class="mt-2 flex items-center gap-1.5 text-sm font-medium text-rose-600">${Icons.alert(15)} CNPJ inválido — confira os dígitos verificadores.</p>` : ''}
+      <p class="mt-2 text-xs text-slate-500">Digite apenas números — a máscara é aplicada automaticamente. Limite da API pública: 3 consultas por minuto.</p>
+    </div>`;
+}
+
+/* ================================================================== */
+/* Renderização: SummaryView                                           */
+/* ================================================================== */
+
+function infoCard(iconHtml, label, contentHtml, span = false) {
+  return `
+    <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm ${span ? 'sm:col-span-2' : ''}">
+      <div class="mb-2 flex items-center gap-2 text-slate-500">
+        <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600">${iconHtml}</span>
+        <span class="text-xs font-semibold uppercase tracking-wider">${label}</span>
+      </div>
+      <div class="text-[15px] font-medium leading-relaxed text-slate-800">${contentHtml}</div>
+    </div>`;
+}
+
+const NA = '<span class="font-normal text-slate-400">Não informado</span>';
+
+function renderSummaryView(data) {
+  const est = data?.estabelecimento ?? {};
+  const cidade = est.cidade?.nome ?? est.nome_cidade_exterior;
+  const uf = est.estado?.sigla ?? est.pais?.nome;
+  const endereco = [[est.tipo_logradouro, est.logradouro].filter(Boolean).join(' '), est.numero].filter(Boolean).join(', ');
+  const enderecoLinha2 = [est.complemento, est.bairro].filter(Boolean).join(' · ');
+  const cep = est.cep ? formatCEP(est.cep) : null;
+  const cnae = est.atividade_principal;
+  const tel1 = formatPhone(est.telefone1, est.ddd1);
+  const tel2 = formatPhone(est.telefone2, est.ddd2);
+  const tone = situacaoTone(est.situacao_cadastral);
+  const ies = Array.isArray(est.inscricoes_estaduais) ? est.inscricoes_estaduais : [];
+
+  const enderecoContent = endereco
+    ? `<p>${esc(endereco)}</p>${enderecoLinha2 ? `<p class="text-slate-500">${esc(enderecoLinha2)}</p>` : ''}${cep ? `<p class="text-slate-500">CEP ${esc(cep)}</p>` : ''}`
+    : NA;
+
+  const cidadeContent = (cidade || uf)
+    ? `<p>${esc(cidade ?? '—')}${uf ? ` — ${esc(uf)}` : ''}</p>${(est.estado?.nome && uf !== est.estado.nome) ? `<p class="text-slate-500">${esc(est.estado.nome)}</p>` : ''}`
+    : NA;
+
+  const cnaeContent = cnae
+    ? `<p><span class="mr-2 rounded-md bg-indigo-50 px-2 py-0.5 font-mono text-[13px] font-semibold text-indigo-700">${esc(cnae.subclasse ?? cnae.id)}</span>${esc(cnae.descricao)}</p>`
+    : NA;
+
+  const telContent = (tel1 || tel2)
+    ? `${tel1 ? `<p>${esc(tel1)}</p>` : ''}${tel2 ? `<p class="text-slate-500">${esc(tel2)}</p>` : ''}`
+    : NA;
+
+  const emailContent = est.email
+    ? `<a href="mailto:${esc(est.email)}" class="break-all text-indigo-600 underline-offset-2 hover:underline">${esc(est.email.toLowerCase())}</a>`
+    : NA;
+
+  const capitalContent = (data?.capital_social != null && data.capital_social !== '')
+    ? `<p class="text-lg font-bold text-slate-900">${esc(formatCurrencyBRL(data.capital_social))}</p>`
+    : NA;
+
+  const aberturaContent = est.data_inicio_atividade ? `<p>${esc(formatDateBR(est.data_inicio_atividade))}</p>` : NA;
+
+  const naturezaContent = data?.natureza_juridica?.descricao
+    ? `<p>${esc(data.natureza_juridica.descricao)}<span class="ml-2 font-mono text-[13px] text-slate-400">${esc(data.natureza_juridica.id)}</span></p>`
+    : NA;
+
+  const iesHtml = ies.length === 0
+    ? `<p class="text-sm text-slate-400">Nenhuma inscrição estadual informada.</p>`
+    : `<ul class="flex flex-wrap gap-2">${ies.map((ie) => `
+        <li class="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-sm">
+          <span class="font-mono font-semibold text-slate-800">${esc(ie?.inscricao_estadual ?? '—')}</span>
+          ${ie?.estado?.sigla ? `<span class="rounded-md bg-indigo-100 px-1.5 py-0.5 text-xs font-bold text-indigo-700">${esc(ie.estado.sigla)}</span>` : ''}
+          ${typeof ie?.ativo === 'boolean' ? `<span class="inline-flex items-center gap-1 text-xs font-semibold ${ie.ativo ? 'text-emerald-600' : 'text-rose-500'}"><span class="h-1.5 w-1.5 rounded-full ${ie.ativo ? 'bg-emerald-500' : 'bg-rose-500'}"></span>${ie.ativo ? 'Ativa' : 'Inativa'}</span>` : ''}
+        </li>`).join('')}</ul>`;
+
+  return `
+    <div class="space-y-4">
+      <div class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div class="border-b border-slate-100 bg-gradient-to-br from-indigo-600 to-blue-700 px-6 py-6 text-white">
+          <div class="flex flex-wrap items-start justify-between gap-4">
+            <div class="min-w-0">
+              <p class="mb-1 text-xs font-semibold uppercase tracking-widest text-indigo-200">Razão social</p>
+              <h2 class="text-2xl font-bold leading-tight sm:text-3xl">${esc(data?.razao_social ?? '—')}</h2>
+              ${est.nome_fantasia ? `<p class="mt-1.5 text-sm text-indigo-100"><span class="font-medium">Nome fantasia:</span> ${esc(est.nome_fantasia)}</p>` : ''}
+            </div>
+            <span class="inline-flex shrink-0 items-center gap-2 rounded-full px-4 py-1.5 text-sm font-semibold ring-1 ${tone.badge}">
+              <span class="h-2 w-2 rounded-full ${tone.dot}"></span>
+              ${esc(est.situacao_cadastral ?? 'Situação desconhecida')}
+            </span>
+          </div>
+        </div>
+        <div class="flex flex-wrap gap-x-8 gap-y-3 px-6 py-4 text-sm">
+          <span class="inline-flex items-center gap-2 text-slate-600">${Icons.hash(16,'text-slate-400')}<span class="font-mono font-semibold text-slate-800">${esc(formatCNPJ(est.cnpj ?? ''))}</span></span>
+          ${est.tipo ? `<span class="inline-flex items-center gap-2 text-slate-600">${Icons.building(16,'text-slate-400')}${esc(est.tipo)}</span>` : ''}
+          ${data?.porte?.descricao ? `<span class="inline-flex items-center gap-2 text-slate-600">${Icons.briefcase(16,'text-slate-400')}Porte: <b class="font-semibold text-slate-800">${esc(data.porte.descricao)}</b></span>` : ''}
+          ${est.data_situacao_cadastral ? `<span class="inline-flex items-center gap-2 text-slate-600">${Icons.calendar(16,'text-slate-400')}Situação desde ${esc(formatDateBR(est.data_situacao_cadastral))}</span>` : ''}
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        ${infoCard(Icons.mapPin(17), 'Endereço', enderecoContent)}
+        ${infoCard(Icons.mapPin(17), 'Cidade / UF', cidadeContent)}
+        ${infoCard(Icons.activity(17), 'CNAE Principal', cnaeContent, true)}
+        ${infoCard(Icons.phone(17), 'Telefone', telContent)}
+        ${infoCard(Icons.mail(17), 'E-mail', emailContent)}
+        ${infoCard(Icons.banknote(17), 'Capital Social', capitalContent)}
+        ${infoCard(Icons.calendar(17), 'Data de Abertura', aberturaContent)}
+        ${infoCard(Icons.landmark(17), 'Natureza Jurídica', naturezaContent, true)}
+      </div>
+
+      <div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div class="mb-3 flex items-center gap-2 text-slate-500">
+          <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600">${Icons.idCard(17)}</span>
+          <span class="text-xs font-semibold uppercase tracking-wider">Inscrições Estaduais</span>
+          ${ies.length > 0 ? `<span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-bold text-slate-600">${ies.length}</span>` : ''}
+        </div>
+        ${iesHtml}
+      </div>
+    </div>`;
+}
+
+/* ================================================================== */
+/* Renderização: DynamicData (todos os dados, recursivo)                */
+/* ================================================================== */
+
+const SINGULAR = { socios: 'Sócio', atividades_secundarias: 'Atividade', inscricoes_estaduais: 'Inscrição' };
+
+function guessTitle(item, index, parentKey) {
+  if (item && typeof item === 'object') {
+    if (item.nome) return String(item.nome);
+    if (item.subclasse && item.descricao) return `${item.subclasse} · ${item.descricao}`;
+    if (item.inscricao_estadual) return `IE ${item.inscricao_estadual}${item?.estado?.sigla ? ` — ${item.estado.sigla}` : ''}`;
+    if (item.descricao) return String(item.descricao);
+  }
+  return `${SINGULAR[parentKey] ?? 'Item'} ${index + 1}`;
+}
+
+function primitiveValueHtml(k, v) {
+  if (typeof v === 'boolean') {
+    return `<span class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold ${v ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-1 ring-slate-200'}">
+      <span class="h-1.5 w-1.5 rounded-full ${v ? 'bg-emerald-500' : 'bg-slate-400'}"></span>${v ? 'Sim' : 'Não'}</span>`;
+  }
+  const text = formatValue(k, v);
+  if (text === '—') return `<span class="text-slate-300">—</span>`;
+  const mono = k.toLowerCase().includes('cnpj') || k.toLowerCase() === 'cep' || k.toLowerCase().includes('telefone');
+  return `<span class="break-words text-slate-800 ${mono ? 'font-mono text-[13px]' : ''}">${esc(text)}</span>`;
+}
+
+function primitiveRowHtml(k, v) {
+  return `<div class="min-w-0">
+    <dt class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">${esc(humanizeKey(k))}</dt>
+    <dd class="mt-0.5 text-sm font-medium leading-snug">${primitiveValueHtml(k, v)}</dd>
+  </div>`;
+}
+
+function objectBodyHtml(obj, depth) {
+  const entries = Object.entries(obj);
+  const primitives = entries.filter(([, v]) => v === null || typeof v !== 'object');
+  const objects = entries.filter(([, v]) => v !== null && typeof v === 'object' && !Array.isArray(v));
+  const arrays = entries.filter(([, v]) => Array.isArray(v));
+
+  let html = '<div class="space-y-4">';
+  if (primitives.length > 0) {
+    html += `<dl class="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">${primitives.map(([k, v]) => primitiveRowHtml(k, v)).join('')}</dl>`;
+  }
+  for (const [k, v] of objects) {
+    html += `<div class="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+      <p class="mb-3 flex items-center gap-2 text-[12px] font-bold uppercase tracking-wider text-slate-500"><span class="text-indigo-500">${iconFor(k)}</span>${esc(humanizeKey(k))}</p>
+      ${objectBodyHtml(v, depth + 1)}
+    </div>`;
+  }
+  for (const [k, v] of arrays) {
+    html += arrayBlockHtml(k, v, depth, false);
+  }
+  html += '</div>';
+  return html;
+}
+
+function arrayBlockHtml(k, arr, depth, bare) {
+  const isObjects = arr.some((it) => it !== null && typeof it === 'object');
+  let html = `<div class="${bare ? '' : 'rounded-xl border border-slate-200 bg-slate-50/60 p-4'}">`;
+  if (!bare) {
+    html += `<p class="mb-3 flex items-center gap-2 text-[12px] font-bold uppercase tracking-wider text-slate-500">
+      <span class="text-indigo-500">${iconFor(k)}</span>${esc(humanizeKey(k))}
+      <span class="rounded-full bg-indigo-100 px-2 py-0.5 text-[11px] font-bold text-indigo-700">${arr.length}</span></p>`;
+  }
+  if (arr.length === 0) {
+    html += `<p class="text-sm italic text-slate-400">Lista vazia — nenhum registro retornado.</p>`;
+  }
+  if (arr.length > 0 && !isObjects) {
+    html += `<ul class="flex flex-wrap gap-2">${arr.map((it) => `<li class="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700">${esc(formatValue(k, it))}</li>`).join('')}</ul>`;
+  }
+  if (isObjects) {
+    html += '<ol class="space-y-2">';
+    arr.forEach((item, i) => {
+      if (item !== null && typeof item === 'object') {
+        html += `<li><details ${i === 0 ? 'open' : ''} class="group overflow-hidden rounded-xl border border-slate-200 bg-white transition">
+          <summary class="flex cursor-pointer select-none items-center gap-3 px-4 py-3 transition hover:bg-slate-50">
+            <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-indigo-600 text-[11px] font-bold text-white">${i + 1}</span>
+            <span class="min-w-0 flex-1 truncate text-sm font-semibold text-slate-700">${esc(guessTitle(item, i, k))}</span>
+            <span class="chevron shrink-0 text-slate-400 transition-transform">${Icons.chevronDown(16)}</span>
+          </summary>
+          <div class="border-t border-slate-100 px-4 py-4">${objectBodyHtml(item, depth + 1)}</div>
+        </details></li>`;
+      } else {
+        html += `<li class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">${esc(formatValue(k, item))}</li>`;
+      }
+    });
+    html += '</ol>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function rootSectionHtml(k, v) {
+  const isArr = Array.isArray(v);
+  return `<section class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+    <header class="flex items-center gap-2.5 border-b border-slate-100 bg-gradient-to-r from-slate-50 to-white px-5 py-3.5">
+      <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-white shadow-sm">${isArr ? Icons.list(16) : iconFor(k)}</span>
+      <h3 class="text-sm font-bold uppercase tracking-wider text-slate-700">${esc(humanizeKey(k))}</h3>
+      ${isArr ? `<span class="rounded-full bg-indigo-100 px-2 py-0.5 text-xs font-bold text-indigo-700">${v.length}</span>` : ''}
+    </header>
+    <div class="px-5 py-4">${isArr ? arrayBlockHtml(k, v, 0, true) : objectBodyHtml(v, 0)}</div>
+  </section>`;
+}
+
+function renderDynamicData(data) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) return '';
+  const entries = Object.entries(data);
+  const primitives = entries.filter(([, v]) => v === null || typeof v !== 'object');
+  const sections = entries.filter(([, v]) => v !== null && typeof v === 'object');
+
+  let html = '<div class="space-y-4">';
+  if (primitives.length > 0) {
+    html += `<section class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <header class="flex items-center gap-2.5 border-b border-slate-100 bg-gradient-to-r from-slate-50 to-white px-5 py-3.5">
+        <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-white shadow-sm">${Icons.fileText(16)}</span>
+        <h3 class="text-sm font-bold uppercase tracking-wider text-slate-700">Informações Gerais</h3>
+      </header>
+      <div class="px-5 py-4"><dl class="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">${primitives.map(([k, v]) => primitiveRowHtml(k, v)).join('')}</dl></div>
+    </section>`;
+  }
+  for (const [k, v] of sections) html += rootSectionHtml(k, v);
+  html += '</div>';
+  return html;
+}
+
+/* ================================================================== */
+/* Renderização: RawJson (com highlight)                                */
+/* ================================================================== */
+
+function highlightJSON(json) {
+  const re = /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*")(\s*:)?|\b(?:true|false)\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+  let result = '';
+  let last = 0;
+  let m;
+  while ((m = re.exec(json)) !== null) {
+    if (m.index > last) result += esc(json.slice(last, m.index));
+    const full = m[0], str = m[1], colon = m[2];
+    if (str !== undefined) {
+      if (colon !== undefined) {
+        result += `<span class="text-sky-300">${esc(str)}</span><span class="text-slate-500">${esc(colon)}</span>`;
+      } else {
+        result += `<span class="text-emerald-300">${esc(full)}</span>`;
+      }
+    } else if (full === 'true' || full === 'false') {
+      result += `<span class="text-amber-300">${full}</span>`;
+    } else if (full === 'null') {
+      result += `<span class="text-rose-300">${full}</span>`;
+    } else {
+      result += `<span class="text-violet-300">${full}</span>`;
+    }
+    last = m.index + full.length;
+  }
+  if (last < json.length) result += esc(json.slice(last));
+  return result;
+}
+
+function renderRawJson(data) {
+  const text = JSON.stringify(data, null, 2);
+  return `<div class="overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 shadow-sm">
+    <div class="flex items-center justify-between border-b border-slate-700/70 px-5 py-3">
+      <span class="text-xs font-bold uppercase tracking-wider text-slate-400">Resposta bruta da API</span>
+      <span class="rounded-md bg-slate-800 px-2 py-1 font-mono text-[11px] text-slate-400">application/json</span>
+    </div>
+    <pre class="max-h-[70vh] overflow-auto px-5 py-4 font-mono text-[12.5px] leading-relaxed text-slate-300">${highlightJSON(text)}</pre>
+  </div>`;
+}
+
+/* ================================================================== */
+/* Renderização: Skeleton (carregando)                                  */
+/* ================================================================== */
+
+function renderSkeleton() {
+  const bar = 'animate-pulse rounded-lg bg-slate-200';
+  return `<div class="space-y-4" aria-busy="true">
+    <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+      <div class="${bar} mb-3 h-8 w-2/3"></div>
+      <div class="${bar} h-4 w-1/3"></div>
+      <div class="mt-5 flex gap-3"><div class="${bar} h-6 w-40"></div><div class="${bar} h-6 w-24"></div></div>
+    </div>
+    <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+      ${Array.from({ length: 6 }).map(() => `<div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><div class="${bar} mb-3 h-4 w-28"></div><div class="${bar} h-5 w-4/5"></div></div>`).join('')}
+    </div>
+  </div>`;
+}
+
+/* ================================================================== */
+/* Página principal                                                     */
+/* ================================================================== */
+
+function renderPage() {
+  const fields = state.data ? countFields(state.data) : { filled: 0, total: 0 };
+  const tabs = [
+    { id: 'resumo', label: 'Resumo', icon: Icons.building(16) },
+    { id: 'completo', label: 'Todos os dados', icon: Icons.list(16) },
+    { id: 'json', label: 'JSON bruto', icon: Icons.code(16) },
+  ];
+
+  let bodyContent = '';
+
+  if (state.status === 'idle') {
+    bodyContent = `
+      <div class="mt-12 text-center">
+        <div class="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-600">${Icons.shield(30)}</div>
+        <h3 class="text-lg font-bold text-slate-800">Comece digitando um CNPJ acima</h3>
+        <p class="mx-auto mt-1 max-w-md text-sm text-slate-500">Ou experimente um dos exemplos abaixo:</p>
+        <div class="mt-5 flex flex-wrap justify-center gap-2">
+          ${EXAMPLES.map((ex) => `
+            <button data-example-cnpj="${esc(ex.cnpj)}" class="group example-btn rounded-full border border-slate-200 bg-white px-4 py-2 text-sm shadow-sm transition hover:border-indigo-300 hover:bg-indigo-50">
+              <span class="font-medium text-slate-700 group-hover:text-indigo-700">${esc(ex.label)}</span>
+              <span class="ml-2 font-mono text-xs text-slate-400">${esc(ex.cnpj)}</span>
+            </button>`).join('')}
+        </div>
+      </div>`;
+  } else if (state.status === 'loading') {
+    bodyContent = `
+      <div class="mt-8">
+        <p class="mb-4 text-center text-sm font-medium text-slate-500">Consultando <span class="font-mono font-semibold text-slate-700">${esc(formatCNPJ(state.queried))}</span> na Receita Federal…</p>
+        ${renderSkeleton()}
+      </div>`;
+  } else if (state.status === 'error' && state.error) {
+    const err = state.error;
+    bodyContent = `
+      <div class="mx-auto mt-10 max-w-xl rounded-2xl border border-rose-200 bg-white p-8 text-center shadow-sm">
+        <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-rose-50 text-rose-500">${Icons.alert(28)}</div>
+        <h3 class="text-lg font-bold text-slate-800">${esc(err.title)}</h3>
+        <p class="mt-2 text-sm leading-relaxed text-slate-500">${esc(err.message)}</p>
+        ${err.hint ? `<p class="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700 ring-1 ring-amber-200">${esc(err.hint)}</p>` : ''}
+        <div class="mt-6 flex justify-center gap-3">
+          <button id="retry-btn" class="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-700">${Icons.refresh(16)} Tentar novamente</button>
+          <button id="reset-btn-error" class="rounded-xl border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50">Nova consulta</button>
+        </div>
+      </div>`;
+  } else if (state.status === 'success' && state.data) {
+    const pct = fields.total ? Math.round((fields.filled / fields.total) * 100) : 0;
+    let tabContent = '';
+    if (state.tab === 'resumo') tabContent = renderSummaryView(state.data);
+    else if (state.tab === 'completo') tabContent = renderDynamicData(state.data);
+    else if (state.tab === 'json') tabContent = renderRawJson(state.data);
+
+    bodyContent = `
+      <div id="resultado" class="mt-8 scroll-mt-6">
+        <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+          <nav class="flex shrink-0 rounded-xl border border-slate-200 bg-white p-1 shadow-sm" aria-label="Visualização">
+            ${tabs.map((t) => `
+              <button data-tab="${t.id}" class="tab-btn inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3.5 py-2 text-sm font-semibold transition sm:flex-none ${state.tab === t.id ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}">
+                ${t.icon}<span class="hidden sm:inline">${t.label}</span>
+              </button>`).join('')}
+          </nav>
+          <div class="flex flex-wrap items-center gap-2">
+            <span title="${fields.filled} campos com valor, de ${fields.total} campos no total" class="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-600 shadow-sm">
+              ${Icons.check(14,'text-emerald-500')}${fields.filled} de ${fields.total} campos preenchidos
+              <span class="h-1.5 w-16 overflow-hidden rounded-full bg-slate-200"><span class="block h-full rounded-full bg-emerald-500 transition-all" style="width:${pct}%"></span></span>
+            </span>
+            <button id="copy-btn" class="inline-flex items-center gap-1.5 rounded-xl border px-3.5 py-2 text-xs font-semibold shadow-sm transition ${state.copied ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}">
+              ${state.copied ? Icons.check(14) : Icons.copy(14)}${state.copied ? 'JSON copiado!' : 'Copiar JSON'}
+            </button>
+            <button id="reset-btn-success" class="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50">
+              ${Icons.refresh(14)} Nova consulta
+            </button>
+          </div>
+        </div>
+        ${tabContent}
+      </div>`;
+  }
+
+  return `
+    <div class="min-h-screen bg-slate-100 text-slate-900 antialiased">
+      <header class="relative overflow-hidden bg-gradient-to-br from-indigo-950 via-indigo-900 to-blue-900 pb-24 pt-10">
+        <div class="pointer-events-none absolute inset-0 opacity-[0.15]" style="background-image: radial-gradient(circle at 1px 1px, #fff 1px, transparent 0); background-size: 26px 26px;"></div>
+        <div class="relative mx-auto max-w-4xl px-4">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <span class="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 text-white ring-1 ring-white/20 backdrop-blur">${Icons.database(22)}</span>
+              <div>
+                <h1 class="text-xl font-bold tracking-tight text-white">Consulta CNPJ</h1>
+                <p class="text-xs text-indigo-300">Dados públicos da Receita Federal</p>
+              </div>
+            </div>
+            <a href="https://docs.cnpj.ws" target="_blank" rel="noreferrer" class="hidden items-center gap-1.5 rounded-lg bg-white/10 px-3 py-1.5 text-xs font-medium text-indigo-100 ring-1 ring-white/15 transition hover:bg-white/20 sm:inline-flex">
+              ${Icons.info(14)} API cnpj.ws
+            </a>
+          </div>
+          <div class="mt-10 text-center">
+            <h2 class="text-3xl font-extrabold tracking-tight text-white sm:text-4xl">Consulte qualquer CNPJ do Brasil</h2>
+            <p class="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-indigo-200 sm:text-base">
+              Razão social, situação cadastral, endereço, CNAEs, sócios, inscrições estaduais e todos os demais campos retornados pela API — renderizados automaticamente.
+            </p>
+          </div>
+        </div>
+      </header>
+
+      <main class="relative mx-auto max-w-4xl px-4">
+        <div class="relative z-10 -mt-14">${renderSearchBar()}</div>
+        ${bodyContent}
+        <footer class="mt-16 border-t border-slate-200 py-8 text-center">
+          <p class="text-xs leading-relaxed text-slate-400">
+            Fonte: API pública <a href="https://cnpj.ws" target="_blank" rel="noreferrer" class="font-medium text-indigo-400 hover:underline">cnpj.ws</a> · dados da Receita Federal do Brasil · limite de 3 consultas por minuto.
+            <br>As informações exibidas têm caráter meramente informativo.
+          </p>
+        </footer>
+      </main>
+    </div>`;
+}
+
+/* ================================================================== */
+/* Loop de render + event delegation                                    */
+/* ================================================================== */
+
+/** Converte uma posição de caractere (numa string mascarada) na quantidade
+ *  de dígitos que a precedem — usado para "ancorar" o cursor no dígito certo,
+ *  independente de onde os separadores (. / -) caem. */
+function digitsBefore(str, pos) {
+  let count = 0;
+  for (let i = 0; i < pos && i < str.length; i++) {
+    if (/\d/.test(str[i])) count++;
+  }
+  return count;
+}
+
+/** Encontra a posição de caractere, na string mascarada, logo após o
+ *  N-ésimo dígito (usado para recolocar o cursor depois de remascarar). */
+function posAfterDigits(str, digitCount) {
+  if (digitCount <= 0) return 0;
+  let count = 0;
+  for (let i = 0; i < str.length; i++) {
+    if (/\d/.test(str[i])) {
+      count++;
+      if (count === digitCount) return i + 1;
+    }
+  }
+  return str.length;
+}
+
+// Posição de cursor explícita a aplicar no próximo render (em nº de dígitos
+// antes do cursor), definida pelo handler de input/keydown do campo de CNPJ.
+let pendingDigitCursor = null;
+
+function render() {
+  const app = document.getElementById('app');
+  const activeEl = document.activeElement;
+  const wasInputFocused = activeEl && activeEl.id === 'cnpj-input';
+  const digitCursor = wasInputFocused ? pendingDigitCursor : null;
+  pendingDigitCursor = null;
+
+  app.innerHTML = renderPage();
+  attachEvents();
+
+  if (wasInputFocused) {
+    const input = document.getElementById('cnpj-input');
+    if (input) {
+      input.focus();
+      if (digitCursor !== null) {
+        const pos = posAfterDigits(input.value, digitCursor);
+        input.setSelectionRange(pos, pos);
+      }
+    }
+  }
+}
+
+function attachEvents() {
+  const input = document.getElementById('cnpj-input');
+  if (input) {
+    input.addEventListener('input', (e) => {
+      // Quantos dígitos existem antes do cursor, na string ANTES de remascarar
+      const digitCount = digitsBefore(e.target.value, e.target.selectionStart);
+      state.touched = false;
+      state.input = maskCNPJ(e.target.value);
+      pendingDigitCursor = digitCount;
+      render();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitSearch();
+    });
+    input.addEventListener('blur', () => {
+      if (onlyDigits(state.input).length > 0) {
+        state.touched = true;
+        render();
+      }
+    });
+  }
+
+  const searchBtn = document.getElementById('search-btn');
+  if (searchBtn) searchBtn.addEventListener('click', submitSearch);
+
+  document.querySelectorAll('.example-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const cnpj = btn.getAttribute('data-example-cnpj');
+      state.input = cnpj;
+      search(onlyDigits(cnpj));
+    });
+  });
+
+  document.querySelectorAll('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.tab = btn.getAttribute('data-tab');
+      render();
+    });
+  });
+
+  const copyBtn = document.getElementById('copy-btn');
+  if (copyBtn) copyBtn.addEventListener('click', copyJSON);
+
+  const retryBtn = document.getElementById('retry-btn');
+  if (retryBtn) retryBtn.addEventListener('click', () => search(state.queried));
+
+  const resetBtnError = document.getElementById('reset-btn-error');
+  if (resetBtnError) resetBtnError.addEventListener('click', reset);
+
+  const resetBtnSuccess = document.getElementById('reset-btn-success');
+  if (resetBtnSuccess) resetBtnSuccess.addEventListener('click', reset);
+}
+
+function submitSearch() {
+  const digits = onlyDigits(state.input);
+  state.touched = true;
+  if (digits.length !== 14 || !isValidCNPJ(digits) || state.status === 'loading') {
+    render();
+    return;
+  }
+  search(digits);
+}
+
+render();
+</script>
+</body>
+</html>
